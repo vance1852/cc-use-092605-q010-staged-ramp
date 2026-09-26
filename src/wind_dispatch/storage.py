@@ -180,6 +180,72 @@ CREATE TABLE IF NOT EXISTS supply_idempotency (
     PRIMARY KEY(scope, idempotency_key)
 );
 
+CREATE TABLE IF NOT EXISTS ramp_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL UNIQUE,
+    basis_sha256 TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ramp_snapshots_command
+ON ramp_snapshots(command_id, created_at);
+
+CREATE TABLE IF NOT EXISTS ramp_plans (
+    plan_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES ramp_snapshots(snapshot_id),
+    command_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    phases_json TEXT NOT NULL,
+    capacity_json TEXT NOT NULL,
+    peak_target_mw TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft'
+        CHECK(state IN ('draft','confirmed','fallback','completed','retired')),
+    phase_index INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    confirmed_at TEXT,
+    closed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ramp_plans_command
+ON ramp_plans(command_id, state);
+
+CREATE TABLE IF NOT EXISTS ramp_receipts (
+    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES ramp_plans(plan_id),
+    phase TEXT NOT NULL CHECK(phase IN ('prepare','trial_send','expand','steady')),
+    receipt_key TEXT NOT NULL,
+    actual_mw TEXT NOT NULL,
+    note TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, receipt_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ramp_receipts_plan
+ON ramp_receipts(plan_id, phase);
+
+CREATE TABLE IF NOT EXISTS ramp_reservations (
+    reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES ramp_plans(plan_id),
+    source_kind TEXT NOT NULL
+        CHECK(source_kind IN ('unit_capability','corridor_thermal','reactive_support','spinning_reserve')),
+    source_id TEXT NOT NULL,
+    reserved_amount TEXT NOT NULL,
+    unit TEXT NOT NULL CHECK(unit IN ('MW','Mvar')),
+    state TEXT NOT NULL DEFAULT 'held' CHECK(state IN ('held','released')),
+    created_at TEXT NOT NULL,
+    released_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ramp_reservations_plan
+ON ramp_reservations(plan_id, state);
+
 CREATE TABLE IF NOT EXISTS supply_audit_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     entity_type TEXT NOT NULL,
@@ -198,7 +264,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

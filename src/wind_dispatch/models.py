@@ -16,6 +16,8 @@ IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 POWER_PRICE_INDEXES = {"PEAK_VALLEY", "MARKET_SETTLED", "GRID_COMMITTED", "DAY_AHEAD", "REGULATED", "CUSTOM"}
 PRODUCTS = {"turbine-18mw", "turbine-16mw", "turbine-14mw", "reactive-compensator", "subsea-cable", "maintenance-vessel"}
 ROUTE_KINDS = {"export-corridor", "offshore-station", "station", "storage", "compensation-station"}
+TURBINE_PRODUCTS = {"turbine-18mw", "turbine-16mw", "turbine-14mw"}
+RAMP_PHASES = ("prepare", "trial_send", "expand", "steady")
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -259,4 +261,336 @@ class SupplyScenario:
             ),
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
+        )
+
+
+def optional_decimal(
+    value: object,
+    field: str,
+    *,
+    minimum: Decimal | None = None,
+    maximum: Decimal | None = None,
+) -> Decimal | None:
+    if value is None:
+        return None
+    return decimal_value(value, field, minimum=minimum, maximum=maximum)
+
+
+@dataclass(frozen=True, slots=True)
+class SeaStateObservation:
+    wind_speed_mps: Decimal
+    wave_height_m: Decimal
+    observed_at: str
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "SeaStateObservation":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("sea_state 必须是对象")
+        observed_at = required_text(raw.get("observed_at"), "sea_state.observed_at", 40)
+        try:
+            parse_utc(observed_at, "sea_state.observed_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return cls(
+            wind_speed_mps=decimal_value(
+                raw.get("wind_speed_mps"), "sea_state.wind_speed_mps",
+                minimum=Decimal("0"), maximum=Decimal("70"),
+            ),
+            wave_height_m=decimal_value(
+                raw.get("wave_height_m"), "sea_state.wave_height_m",
+                minimum=Decimal("0"), maximum=Decimal("30"),
+            ),
+            observed_at=observed_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnitCapability:
+    unit_id: str
+    product: str
+    available_mw: Decimal
+    ramp_mw_per_min: Decimal
+    ready: bool
+
+    @classmethod
+    def from_dict(cls, raw: object, field: str) -> "UnitCapability":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed(f"{field} 必须是对象")
+        product = required_text(raw.get("product"), f"{field}.product", 32)
+        if product not in TURBINE_PRODUCTS:
+            raise ValidationFailed(f"{field}.product 必须是风电机组类型")
+        ready = raw.get("ready", True)
+        if not isinstance(ready, bool):
+            raise ValidationFailed(f"{field}.ready 必须是布尔值")
+        return cls(
+            unit_id=identifier(raw.get("unit_id"), f"{field}.unit_id"),
+            product=product,
+            available_mw=decimal_value(
+                raw.get("available_mw"), f"{field}.available_mw",
+                minimum=Decimal("0.001"), maximum=Decimal("1000"),
+            ),
+            ramp_mw_per_min=decimal_value(
+                raw.get("ramp_mw_per_min"), f"{field}.ramp_mw_per_min",
+                minimum=Decimal("0.001"), maximum=Decimal("200"),
+            ),
+            ready=ready,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectCapability:
+    project_id: str
+    units: tuple[UnitCapability, ...]
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "ProjectCapability":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("projects 元素必须是对象")
+        project_id = identifier(raw.get("project_id"), "projects.project_id")
+        units_raw = raw.get("units")
+        if not isinstance(units_raw, list) or not 1 <= len(units_raw) <= 200:
+            raise ValidationFailed("projects.units 必须包含 1 到 200 台机组")
+        units = tuple(
+            UnitCapability.from_dict(item, f"{project_id}.units") for item in units_raw
+        )
+        if len({unit.unit_id for unit in units}) != len(units):
+            raise ValidationFailed("机组编号不能重复")
+        return cls(project_id=project_id, units=units)
+
+
+@dataclass(frozen=True, slots=True)
+class CorridorCapability:
+    corridor_id: str
+    route_id: str
+    thermal_limit_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "CorridorCapability":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("corridors 元素必须是对象")
+        return cls(
+            corridor_id=identifier(raw.get("corridor_id"), "corridors.corridor_id"),
+            route_id=identifier(raw.get("route_id"), "corridors.route_id"),
+            thermal_limit_mw=decimal_value(
+                raw.get("thermal_limit_mw"), "corridors.thermal_limit_mw",
+                minimum=Decimal("0.001"), maximum=Decimal("10000"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CompensationCapability:
+    station_id: str
+    reactive_support_mvar: Decimal
+    power_factor_limit: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "CompensationCapability":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("compensation 元素必须是对象")
+        return cls(
+            station_id=identifier(raw.get("station_id"), "compensation.station_id"),
+            reactive_support_mvar=decimal_value(
+                raw.get("reactive_support_mvar"), "compensation.reactive_support_mvar",
+                minimum=Decimal("0.001"), maximum=Decimal("2000"),
+            ),
+            power_factor_limit=decimal_value(
+                raw.get("power_factor_limit"), "compensation.power_factor_limit",
+                minimum=Decimal("0.8"), maximum=Decimal("0.999"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReserveCapability:
+    reserve_id: str
+    spinning_reserve_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "ReserveCapability":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("reserve 元素必须是对象")
+        return cls(
+            reserve_id=identifier(raw.get("reserve_id"), "reserve.reserve_id"),
+            spinning_reserve_mw=decimal_value(
+                raw.get("spinning_reserve_mw"), "reserve.spinning_reserve_mw",
+                minimum=Decimal("0"), maximum=Decimal("5000"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RampSnapshot:
+    """调度人员固定的机组能力、海况观测和通道设施快照。"""
+
+    snapshot_id: str
+    command_id: str
+    projects: tuple[ProjectCapability, ...]
+    sea_state: SeaStateObservation
+    corridors: tuple[CorridorCapability, ...]
+    compensation: tuple[CompensationCapability, ...]
+    reserve: tuple[ReserveCapability, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RampSnapshot":
+        projects_raw = raw.get("projects")
+        if not isinstance(projects_raw, list) or not 1 <= len(projects_raw) <= 8:
+            raise ValidationFailed("projects 必须包含 1 到 8 个子项目")
+        projects = tuple(ProjectCapability.from_dict(item) for item in projects_raw)
+        if len({project.project_id for project in projects}) != len(projects):
+            raise ValidationFailed("子项目编号不能重复")
+        corridors_raw = raw.get("corridors")
+        if not isinstance(corridors_raw, list) or not 1 <= len(corridors_raw) <= 8:
+            raise ValidationFailed("corridors 必须包含 1 到 8 条送出通道")
+        corridors = tuple(CorridorCapability.from_dict(item) for item in corridors_raw)
+        if len({corridor.corridor_id for corridor in corridors}) != len(corridors):
+            raise ValidationFailed("送出通道编号不能重复")
+        compensation_raw = raw.get("compensation")
+        if not isinstance(compensation_raw, list) or not 1 <= len(compensation_raw) <= 4:
+            raise ValidationFailed("compensation 必须包含 1 到 4 座无功补偿站")
+        compensation = tuple(CompensationCapability.from_dict(item) for item in compensation_raw)
+        if len({station.station_id for station in compensation}) != len(compensation):
+            raise ValidationFailed("无功补偿站编号不能重复")
+        reserve_raw = raw.get("reserve")
+        if not isinstance(reserve_raw, list) or not 1 <= len(reserve_raw) <= 4:
+            raise ValidationFailed("reserve 必须包含 1 到 4 项旋转备用")
+        reserve = tuple(ReserveCapability.from_dict(item) for item in reserve_raw)
+        if len({item.reserve_id for item in reserve}) != len(reserve):
+            raise ValidationFailed("旋转备用编号不能重复")
+        return cls(
+            snapshot_id=identifier(raw.get("snapshot_id"), "snapshot_id"),
+            command_id=identifier(raw.get("command_id"), "command_id"),
+            projects=projects,
+            sea_state=SeaStateObservation.from_dict(raw.get("sea_state")),
+            corridors=corridors,
+            compensation=compensation,
+            reserve=reserve,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryPoint:
+    offset_minutes: int
+    target_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "TrajectoryPoint":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("trajectory 元素必须是对象")
+        offset = raw.get("offset_minutes")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 43200:
+            raise ValidationFailed("trajectory.offset_minutes 必须是 0 到 43200 的整数")
+        return cls(
+            offset_minutes=offset,
+            target_mw=decimal_value(
+                raw.get("target_mw"), "trajectory.target_mw",
+                minimum=Decimal("0"), maximum=Decimal("10000"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeratingRule:
+    product: str
+    derate_percent: Decimal
+    wind_speed_above_mps: Decimal | None
+    wave_height_above_m: Decimal | None
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "DeratingRule":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("derating.rules 元素必须是对象")
+        product = required_text(raw.get("product"), "derating.rules.product", 32)
+        if product not in TURBINE_PRODUCTS:
+            raise ValidationFailed("derating.rules.product 必须是风电机组类型")
+        wind = optional_decimal(
+            raw.get("wind_speed_above_mps"), "derating.rules.wind_speed_above_mps",
+            minimum=Decimal("0"), maximum=Decimal("70"),
+        )
+        wave = optional_decimal(
+            raw.get("wave_height_above_m"), "derating.rules.wave_height_above_m",
+            minimum=Decimal("0"), maximum=Decimal("30"),
+        )
+        if wind is None and wave is None:
+            raise ValidationFailed("降额规则必须包含风速或浪高阈值")
+        return cls(
+            product=product,
+            derate_percent=decimal_value(
+                raw.get("derate_percent"), "derating.rules.derate_percent",
+                minimum=Decimal("0.1"), maximum=Decimal("95"),
+            ),
+            wind_speed_above_mps=wind,
+            wave_height_above_m=wave,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeratingStrategy:
+    strategy_id: str
+    rules: tuple[DeratingRule, ...]
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "DeratingStrategy":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("derating 必须是对象")
+        rules_raw = raw.get("rules", [])
+        if not isinstance(rules_raw, list) or len(rules_raw) > 16:
+            raise ValidationFailed("derating.rules 最多包含 16 条规则")
+        return cls(
+            strategy_id=identifier(raw.get("strategy_id"), "derating.strategy_id"),
+            rules=tuple(DeratingRule.from_dict(item) for item in rules_raw),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RampPlanRequest:
+    plan_id: str
+    snapshot_id: str
+    trajectory: tuple[TrajectoryPoint, ...]
+    derating: DeratingStrategy
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RampPlanRequest":
+        trajectory_raw = raw.get("trajectory")
+        if not isinstance(trajectory_raw, list) or not 1 <= len(trajectory_raw) <= 96:
+            raise ValidationFailed("trajectory 必须包含 1 到 96 个轨迹点")
+        trajectory = tuple(TrajectoryPoint.from_dict(item) for item in trajectory_raw)
+        for previous, current in zip(trajectory, trajectory[1:]):
+            if current.offset_minutes <= previous.offset_minutes:
+                raise ValidationFailed("目标功率轨迹时间必须严格递增")
+            if current.target_mw < previous.target_mw:
+                raise ValidationFailed("目标功率轨迹功率不能下降")
+        if trajectory[-1].target_mw <= Decimal("0"):
+            raise ValidationFailed("目标功率轨迹末端功率必须大于零")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            snapshot_id=identifier(raw.get("snapshot_id"), "snapshot_id"),
+            trajectory=trajectory,
+            derating=DeratingStrategy.from_dict(raw.get("derating")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RampReceiptRequest:
+    receipt_key: str
+    phase: str
+    actual_mw: Decimal
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RampReceiptRequest":
+        phase = required_text(raw.get("phase"), "phase", 32)
+        if phase not in RAMP_PHASES:
+            raise ValidationFailed("phase 必须是 prepare、trial_send、expand 或 steady")
+        note = raw.get("note", "")
+        if not isinstance(note, str) or len(note.strip()) > 256:
+            raise ValidationFailed("note 不能超过 256 个字符")
+        return cls(
+            receipt_key=identifier(raw.get("receipt_key"), "receipt_key"),
+            phase=phase,
+            actual_mw=decimal_value(
+                raw.get("actual_mw"), "actual_mw",
+                minimum=Decimal("0"), maximum=Decimal("10000"),
+            ),
+            note=note.strip(),
         )

@@ -1,4 +1,4 @@
-"""结算单价、机组可用量、送出通道和提名的事务用例。"""
+"""结算单价、机组可用量、送出通道、提名和调峰阶段计划的事务用例。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,18 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    RAMP_PHASES,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    RampPlanRequest,
+    RampReceiptRequest,
+    RampSnapshot,
+    Route,
+    SupplyScenario,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,14 +38,26 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .ramp import PHASE_TITLES, build_phase_plan, mw_text, reservation_blocking
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run", "ramp.read"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "ramp.write",
+        "ramp.confirm",
+        "ramp.receipt",
+        "ramp.advance",
+        "ramp.abort",
+        "ramp.read",
+    },
+    "risk": {"outage.write", "scenario.approve", "report.read", "ramp.abort", "ramp.read"},
+    "auditor": {"report.read", "audit.read", "ramp.read"},
 }
 
 
@@ -547,6 +570,523 @@ class SupplyService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    def _basis_fingerprint(self) -> str:
+        """机组能力、海况相关的通道设施等底层数据的当前版本指纹。"""
+        basis = {
+            "facilities": [dict(row) for row in self.connection.execute(
+                "SELECT * FROM facilities ORDER BY facility_id"
+            ).fetchall()],
+            "routes": [dict(row) for row in self.connection.execute(
+                "SELECT * FROM routes ORDER BY route_id"
+            ).fetchall()],
+            "route_outages": [dict(row) for row in self.connection.execute(
+                "SELECT * FROM route_outages ORDER BY outage_id"
+            ).fetchall()],
+            "inventory_lots": [dict(row) for row in self.connection.execute(
+                "SELECT * FROM inventory_lots ORDER BY lot_id"
+            ).fetchall()],
+        }
+        return digest(basis)
+
+    def _ramp_plan(self, plan_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM ramp_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("调峰阶段计划不存在")
+        return row
+
+    def _ramp_snapshot(self, snapshot_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM ramp_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("调峰预演快照不存在")
+        return row
+
+    def _require_basis_fresh(self, snapshot: sqlite3.Row) -> str:
+        current = self._basis_fingerprint()
+        if current != snapshot["basis_sha256"]:
+            raise Conflict("机组能力、海况或通道设施版本已变化，旧计划不能继续推进")
+        return current
+
+    def create_ramp_snapshot(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "ramp.write")
+        snapshot = RampSnapshot.from_dict(raw)
+        for corridor in snapshot.corridors:
+            self.route(corridor.route_id)
+        content = canonical_json(raw)
+        content_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        basis_sha256 = self._basis_fingerprint()
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO ramp_snapshots(snapshot_id,command_id,content_json,content_sha256,"
+                    "basis_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        snapshot.snapshot_id,
+                        snapshot.command_id,
+                        content,
+                        content_sha256,
+                        basis_sha256,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "ramp_snapshot",
+                    snapshot.snapshot_id,
+                    "ramp.snapshot_created",
+                    actor_id,
+                    {"command_id": snapshot.command_id, "basis_sha256": basis_sha256},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("快照编号或内容已经存在") from exc
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "command_id": snapshot.command_id,
+            "basis_sha256": basis_sha256,
+            "content_sha256": content_sha256,
+        }
+
+    def create_ramp_plan(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "ramp.write")
+        request = RampPlanRequest.from_dict(raw)
+        snapshot_row = self._ramp_snapshot(request.snapshot_id)
+        snapshot = RampSnapshot.from_dict(json.loads(snapshot_row["content_json"]))
+        plan = build_phase_plan(snapshot, request.trajectory, request.derating)
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO ramp_plans(plan_id,snapshot_id,command_id,request_json,phases_json,"
+                    "capacity_json,peak_target_mw,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        request.plan_id,
+                        request.snapshot_id,
+                        snapshot_row["command_id"],
+                        canonical_json(raw),
+                        canonical_json(plan["phases"]),
+                        canonical_json(plan["capacity"]),
+                        plan["peak_target_mw"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "ramp_plan",
+                    request.plan_id,
+                    "ramp.plan_created",
+                    actor_id,
+                    {"snapshot_id": request.snapshot_id, "peak_target_mw": plan["peak_target_mw"]},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("阶段计划编号已经存在") from exc
+        return self._ramp_status(self._ramp_plan(request.plan_id))
+
+    def confirm_ramp_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "ramp.confirm")
+        plan = self._ramp_plan(plan_id)
+        if plan["state"] != "draft" or plan["revision"] != expected_revision:
+            raise InvalidState("计划不是当前草稿版本")
+        snapshot = self._ramp_snapshot(plan["snapshot_id"])
+        self._require_basis_fresh(snapshot)
+        capacity = json.loads(plan["capacity_json"])
+        blocking = reservation_blocking(capacity["sources"], capacity["requirements"])
+        if blocking:
+            kinds = "、".join(item["title"] for item in blocking)
+            raise InvalidState(f"容量不足以预留：{kinds}")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE ramp_plans SET state='confirmed',phase_index=0,revision=revision+1,confirmed_at=? "
+                "WHERE plan_id=? AND state='draft' AND revision=?",
+                (now, plan_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("计划不是当前草稿版本")
+            for item in capacity["reservation_split"]:
+                self.connection.execute(
+                    "INSERT INTO ramp_reservations(plan_id,source_kind,source_id,reserved_amount,unit,"
+                    "created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        plan_id,
+                        item["source_kind"],
+                        item["source_id"],
+                        item["reserved_amount"],
+                        item["unit"],
+                        now,
+                    ),
+                )
+            self._audit(
+                "ramp_plan",
+                plan_id,
+                "ramp.plan_confirmed",
+                actor_id,
+                {"reservations": len(capacity["reservation_split"])},
+            )
+        return self._ramp_status(self._ramp_plan(plan_id))
+
+    def record_ramp_receipt(self, actor_id: str, plan_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "ramp.receipt")
+        receipt = RampReceiptRequest.from_dict(raw)
+        plan = self._ramp_plan(plan_id)
+        request_digest = digest(raw)
+        stored = self.connection.execute(
+            "SELECT * FROM ramp_receipts WHERE plan_id=? AND receipt_key=?",
+            (plan_id, receipt.receipt_key),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("回执键对应不同回执内容")
+            return {
+                "receipt_id": stored["receipt_id"],
+                "plan_id": plan_id,
+                "phase": stored["phase"],
+                "actual_mw": stored["actual_mw"],
+                "replayed": True,
+            }
+        if plan["state"] not in ("confirmed", "fallback"):
+            raise InvalidState("计划当前不能接收现场回执")
+        current_phase = RAMP_PHASES[int(plan["phase_index"])]
+        if receipt.phase != current_phase:
+            raise InvalidState(f"回执阶段必须是当前阶段 {current_phase}")
+        duplicate = self.connection.execute(
+            "SELECT 1 FROM ramp_receipts WHERE plan_id=? AND phase=?",
+            (plan_id, receipt.phase),
+        ).fetchone()
+        if duplicate is not None:
+            raise Conflict("该阶段已有现场回执")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO ramp_receipts(plan_id,phase,receipt_key,actual_mw,note,request_sha256,"
+                "created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    plan_id,
+                    receipt.phase,
+                    receipt.receipt_key,
+                    mw_text(receipt.actual_mw),
+                    receipt.note,
+                    request_digest,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            receipt_id = int(cursor.lastrowid)
+            self._audit(
+                "ramp_plan",
+                plan_id,
+                "ramp.receipt_recorded",
+                actor_id,
+                {"receipt_id": receipt_id, "phase": receipt.phase},
+            )
+        return {
+            "receipt_id": receipt_id,
+            "plan_id": plan_id,
+            "phase": receipt.phase,
+            "actual_mw": mw_text(receipt.actual_mw),
+            "replayed": False,
+        }
+
+    def advance_ramp_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "ramp.advance")
+        plan = self._ramp_plan(plan_id)
+        if plan["state"] not in ("confirmed", "fallback") or plan["revision"] != expected_revision:
+            raise InvalidState("计划不是当前可推进版本")
+        snapshot = self._ramp_snapshot(plan["snapshot_id"])
+        self._require_basis_fresh(snapshot)
+        phases = json.loads(plan["phases_json"])
+        index = int(plan["phase_index"])
+        current_phase = RAMP_PHASES[index]
+        receipt = self.connection.execute(
+            "SELECT * FROM ramp_receipts WHERE plan_id=? AND phase=?",
+            (plan_id, current_phase),
+        ).fetchone()
+        if receipt is None:
+            raise InvalidState(f"缺少 {current_phase} 阶段的现场回执")
+        now = self._now()
+        next_index = index + 1
+        with transaction(self.connection, immediate=True):
+            if next_index >= len(phases):
+                cursor = self.connection.execute(
+                    "UPDATE ramp_plans SET state='completed',revision=revision+1,closed_at=? "
+                    "WHERE plan_id=? AND revision=? AND state IN ('confirmed','fallback')",
+                    (now, plan_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidState("计划不是当前可推进版本")
+                self._release_ramp_reservations(plan_id, now)
+                self._audit("ramp_plan", plan_id, "ramp.plan_completed", actor_id, {})
+            else:
+                unmet = [
+                    condition
+                    for condition in phases[next_index]["entry_conditions"]
+                    if not condition["satisfied"]
+                ]
+                if unmet:
+                    kinds = "、".join(condition["title"] for condition in unmet)
+                    raise InvalidState(f"下一阶段进入条件未满足：{kinds}")
+                cursor = self.connection.execute(
+                    "UPDATE ramp_plans SET state='confirmed',phase_index=?,revision=revision+1 "
+                    "WHERE plan_id=? AND revision=? AND state IN ('confirmed','fallback')",
+                    (next_index, plan_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidState("计划不是当前可推进版本")
+                self._audit(
+                    "ramp_plan",
+                    plan_id,
+                    "ramp.plan_advanced",
+                    actor_id,
+                    {"from": current_phase, "to": RAMP_PHASES[next_index]},
+                )
+        return self._ramp_status(self._ramp_plan(plan_id))
+
+    def abort_ramp_plan(
+        self,
+        actor_id: str,
+        plan_id: str,
+        reason: str,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "ramp.abort")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValidationFailed("回退原因不能为空")
+        plan = self._ramp_plan(plan_id)
+        if plan["state"] not in ("confirmed", "fallback") or plan["revision"] != expected_revision:
+            raise InvalidState("计划不是当前可回退版本")
+        index = int(plan["phase_index"])
+        evidenced = {
+            RAMP_PHASES.index(row["phase"])
+            for row in self.connection.execute(
+                "SELECT DISTINCT phase FROM ramp_receipts WHERE plan_id=?", (plan_id,)
+            ).fetchall()
+        }
+        safe = max((item for item in evidenced if item <= index), default=0)
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE ramp_plans SET state='fallback',phase_index=?,revision=revision+1 "
+                "WHERE plan_id=? AND revision=? AND state IN ('confirmed','fallback')",
+                (safe, plan_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("计划不是当前可回退版本")
+            self._audit(
+                "ramp_plan",
+                plan_id,
+                "ramp.plan_aborted",
+                actor_id,
+                {
+                    "reason": reason.strip(),
+                    "from": RAMP_PHASES[index],
+                    "to": RAMP_PHASES[safe],
+                },
+            )
+        return self._ramp_status(self._ramp_plan(plan_id))
+
+    def retire_ramp_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "ramp.write")
+        plan = self._ramp_plan(plan_id)
+        if plan["state"] in ("completed", "retired") or plan["revision"] != expected_revision:
+            raise InvalidState("计划已经关闭")
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE ramp_plans SET state='retired',revision=revision+1,closed_at=? "
+                "WHERE plan_id=? AND revision=? AND state IN ('draft','confirmed','fallback')",
+                (now, plan_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("计划已经关闭")
+            self._release_ramp_reservations(plan_id, now)
+            self._audit("ramp_plan", plan_id, "ramp.plan_retired", actor_id, {})
+        return self._ramp_status(self._ramp_plan(plan_id))
+
+    def _release_ramp_reservations(self, plan_id: str, released_at: str) -> None:
+        self.connection.execute(
+            "UPDATE ramp_reservations SET state='released',released_at=? "
+            "WHERE plan_id=? AND state='held'",
+            (released_at, plan_id),
+        )
+
+    def ramp_plan_status(self, actor_id: str, plan_id: str) -> dict[str, Any]:
+        self._require(actor_id, "ramp.read")
+        return self._ramp_status(self._ramp_plan(plan_id))
+
+    def _ramp_status(self, plan: sqlite3.Row) -> dict[str, Any]:
+        plan_id = plan["plan_id"]
+        snapshot = self._ramp_snapshot(plan["snapshot_id"])
+        basis_sha256 = self._basis_fingerprint()
+        stale = basis_sha256 != snapshot["basis_sha256"]
+        phases = json.loads(plan["phases_json"])
+        capacity = json.loads(plan["capacity_json"])
+        state = plan["state"]
+        index = int(plan["phase_index"])
+        receipts = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM ramp_receipts WHERE plan_id=? ORDER BY receipt_id", (plan_id,)
+            ).fetchall()
+        ]
+        evidenced_phases = {row["phase"] for row in receipts}
+        reservations = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT * FROM ramp_reservations WHERE plan_id=? ORDER BY reservation_id", (plan_id,)
+            ).fetchall()
+        ]
+        held_by_kind: dict[str, Decimal] = {}
+        for row in reservations:
+            if row["state"] == "held":
+                held_by_kind[row["source_kind"]] = held_by_kind.get(row["source_kind"], Decimal("0")) + Decimal(
+                    row["reserved_amount"]
+                )
+        phase_views = []
+        for position, phase in enumerate(phases):
+            if state == "completed" or position < index:
+                phase_status = "completed"
+            elif state == "retired":
+                phase_status = "abandoned"
+            elif position == index and state in ("confirmed", "fallback"):
+                phase_status = "current"
+            else:
+                phase_status = "pending"
+            receipt = next((row for row in receipts if row["phase"] == phase["phase"]), None)
+            phase_views.append({
+                **phase,
+                "status": phase_status,
+                "receipt": None
+                if receipt is None
+                else {
+                    "receipt_id": receipt["receipt_id"],
+                    "actual_mw": receipt["actual_mw"],
+                    "note": receipt["note"],
+                    "received_by": receipt["created_by"],
+                    "received_at": receipt["created_at"],
+                },
+            })
+
+        def phase_ref(position: int) -> dict[str, Any]:
+            phase = phases[position]
+            return {
+                "phase": phase["phase"],
+                "sequence": phase["sequence"],
+                "title": phase["title"],
+                "target_mw": phase["target_mw"],
+            }
+
+        current_phase = None
+        if state in ("confirmed", "fallback"):
+            current_phase = phase_ref(index)
+        elif state == "completed":
+            current_phase = phase_ref(len(phases) - 1)
+        next_phase = None
+        if state == "draft":
+            next_phase = phase_ref(0)
+        elif state in ("confirmed", "fallback") and index + 1 < len(phases):
+            next_phase = phase_ref(index + 1)
+
+        blocking: list[dict[str, Any]] = []
+        if state in ("draft", "confirmed", "fallback") and stale:
+            blocking.append({
+                "kind": "basis_version",
+                "title": "底层版本",
+                "message": "机组能力、海况或通道设施版本已变化，旧计划不能继续推进",
+                "required": snapshot["basis_sha256"],
+                "available": basis_sha256,
+            })
+        if state == "draft":
+            blocking.extend(reservation_blocking(capacity["sources"], capacity["requirements"]))
+        elif state in ("confirmed", "fallback"):
+            current_name = RAMP_PHASES[index]
+            if current_name not in evidenced_phases:
+                blocking.append({
+                    "kind": "field_receipt",
+                    "title": "现场回执",
+                    "message": f"缺少 {current_name} 阶段的现场回执",
+                    "required": current_name,
+                    "available": None,
+                })
+            if index + 1 < len(phases):
+                for condition in phases[index + 1]["entry_conditions"]:
+                    if not condition["satisfied"]:
+                        blocking.append({
+                            "kind": condition["kind"],
+                            "title": condition["title"],
+                            "unit": condition["unit"],
+                            "message": "下一阶段进入条件未满足",
+                            "required": condition["required"],
+                            "available": condition["available"],
+                        })
+
+        rollback = None
+        if state in ("confirmed", "fallback"):
+            evidenced_indexes = {RAMP_PHASES.index(phase) for phase in evidenced_phases}
+            safe = max((item for item in evidenced_indexes if item <= index), default=0)
+            rollback = {
+                "safe_phase": RAMP_PHASES[safe],
+                "safe_sequence": safe,
+                "title": PHASE_TITLES[RAMP_PHASES[safe]],
+                "rollback_margin_mw": phases[index]["rollback_margin_mw"],
+                "accepted_receipts": len(receipts),
+            }
+
+        next_conditions: dict[str, Any] = {}
+        if state == "draft":
+            next_conditions = {item["kind"]: item for item in phases[0]["entry_conditions"]}
+        elif state in ("confirmed", "fallback") and index + 1 < len(phases):
+            next_conditions = {item["kind"]: item for item in phases[index + 1]["entry_conditions"]}
+        binding = set(capacity["first_boundary"]["binding_sources"])
+        sources = []
+        for source in capacity["sources"]:
+            condition = next_conditions.get(source["kind"])
+            sources.append({
+                **source,
+                "reserved": mw_text(held_by_kind.get(source["kind"], Decimal("0"))),
+                "required_next": None if condition is None else condition["required"],
+                "blocking_next": any(item["kind"] == source["kind"] for item in blocking),
+                "binding": source["kind"] in binding,
+            })
+        return {
+            "plan_id": plan_id,
+            "command_id": plan["command_id"],
+            "snapshot_id": plan["snapshot_id"],
+            "state": state,
+            "revision": plan["revision"],
+            "stale": stale,
+            "basis_sha256": snapshot["basis_sha256"],
+            "peak_target_mw": plan["peak_target_mw"],
+            "aggregate_ramp_mw_per_min": capacity["aggregate_ramp_mw_per_min"],
+            "current_phase": current_phase,
+            "next_phase": next_phase,
+            "first_boundary": capacity["first_boundary"],
+            "capacity_sources": sources,
+            "blocking_constraints": blocking,
+            "rollback": rollback,
+            "phases": phase_views,
+            "reservations": [
+                {
+                    "source_kind": row["source_kind"],
+                    "source_id": row["source_id"],
+                    "reserved_amount": row["reserved_amount"],
+                    "unit": row["unit"],
+                    "state": row["state"],
+                }
+                for row in reservations
+            ],
+            "receipts": [
+                {
+                    "receipt_id": row["receipt_id"],
+                    "phase": row["phase"],
+                    "receipt_key": row["receipt_key"],
+                    "actual_mw": row["actual_mw"],
+                    "note": row["note"],
+                    "created_by": row["created_by"],
+                    "created_at": row["created_at"],
+                }
+                for row in receipts
+            ],
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

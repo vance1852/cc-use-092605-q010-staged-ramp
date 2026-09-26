@@ -83,6 +83,22 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/ramp/snapshots":
+                return Response(201, self.service.create_ramp_snapshot(actor, payload))
+            if method == "POST" and path == "/ramp/plans":
+                return Response(201, self.service.create_ramp_plan(actor, payload))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["ramp", "plans"]:
+                return Response(200, self.service.ramp_plan_status(actor, parts[2]))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["ramp", "plans"] and parts[3] == "confirm":
+                return Response(200, self.service.confirm_ramp_plan(actor, parts[2], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["ramp", "plans"] and parts[3] == "receipts":
+                return Response(201, self.service.record_ramp_receipt(actor, parts[2], payload))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["ramp", "plans"] and parts[3] == "advance":
+                return Response(200, self.service.advance_ramp_plan(actor, parts[2], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["ramp", "plans"] and parts[3] == "abort":
+                return Response(200, self.service.abort_ramp_plan(actor, parts[2], payload["reason"], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 4 and parts[:2] == ["ramp", "plans"] and parts[3] == "retire":
+                return Response(200, self.service.retire_ramp_plan(actor, parts[2], int(payload["expected_revision"])))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
