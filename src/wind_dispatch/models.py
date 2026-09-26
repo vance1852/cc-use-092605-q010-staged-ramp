@@ -223,6 +223,218 @@ class NominationRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class SeaStateObservation:
+    wind_speed_mps: Decimal
+    wave_height_m: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "SeaStateObservation":
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("sea_state 必须是对象")
+        return cls(
+            wind_speed_mps=decimal_value(
+                raw.get("wind_speed_mps"), "wind_speed_mps", minimum=Decimal("0"), maximum=Decimal("60")
+            ),
+            wave_height_m=decimal_value(
+                raw.get("wave_height_m"), "wave_height_m", minimum=Decimal("0"), maximum=Decimal("20")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnitCapability:
+    unit_id: str
+    project: str
+    rated_mw: Decimal
+    available: bool
+    ramp_mw_per_min: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "UnitCapability":
+        available = raw.get("available", True)
+        if not isinstance(available, bool):
+            raise ValidationFailed("available 必须是布尔值")
+        rated = decimal_value(raw.get("rated_mw"), "rated_mw", minimum=Decimal("0.001"), maximum=Decimal("30"))
+        return cls(
+            unit_id=identifier(raw.get("unit_id"), "unit_id"),
+            project=identifier(raw.get("project"), "project"),
+            rated_mw=rated,
+            available=available,
+            ramp_mw_per_min=decimal_value(
+                raw.get("ramp_mw_per_min"), "ramp_mw_per_min", minimum=Decimal("0.001"), maximum=rated
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CorridorLimit:
+    corridor_id: str
+    cable_thermal_limit_mw: Decimal
+    reactive_limit_mvar: Decimal
+    spinning_reserve_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "CorridorLimit":
+        return cls(
+            corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
+            cable_thermal_limit_mw=decimal_value(
+                raw.get("cable_thermal_limit_mw"), "cable_thermal_limit_mw",
+                minimum=Decimal("0.001"), maximum=Decimal("5000"),
+            ),
+            reactive_limit_mvar=decimal_value(
+                raw.get("reactive_limit_mvar"), "reactive_limit_mvar",
+                minimum=Decimal("0.001"), maximum=Decimal("2000"),
+            ),
+            spinning_reserve_mw=decimal_value(
+                raw.get("spinning_reserve_mw"), "spinning_reserve_mw",
+                minimum=Decimal("0"), maximum=Decimal("500"),
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RehearsalSnapshotRequest:
+    snapshot_id: str
+    label: str
+    observed_at: str
+    units: tuple[UnitCapability, ...]
+    sea_state: SeaStateObservation
+    corridors: tuple[CorridorLimit, ...]
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RehearsalSnapshotRequest":
+        units_raw = raw.get("units")
+        if not isinstance(units_raw, list) or not 1 <= len(units_raw) <= 500:
+            raise ValidationFailed("units 必须包含 1 到 500 台机组")
+        units = tuple(UnitCapability.from_dict(item) for item in units_raw)
+        if len({unit.unit_id for unit in units}) != len(units):
+            raise ValidationFailed("units 存在重复机组编号")
+        corridors_raw = raw.get("corridors")
+        if not isinstance(corridors_raw, list) or not 1 <= len(corridors_raw) <= 20:
+            raise ValidationFailed("corridors 必须包含 1 到 20 条通道")
+        corridors = tuple(CorridorLimit.from_dict(item) for item in corridors_raw)
+        if len({corridor.corridor_id for corridor in corridors}) != len(corridors):
+            raise ValidationFailed("corridors 存在重复通道编号")
+        observed_at = required_text(raw.get("observed_at"), "observed_at", 40)
+        try:
+            parse_utc(observed_at, "observed_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return cls(
+            snapshot_id=identifier(raw.get("snapshot_id"), "snapshot_id"),
+            label=required_text(raw.get("label"), "label"),
+            observed_at=observed_at,
+            units=units,
+            sea_state=SeaStateObservation.from_dict(raw.get("sea_state")),
+            corridors=corridors,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TrajectoryPoint:
+    offset_minutes: int
+    target_mw: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "TrajectoryPoint":
+        offset = raw.get("offset_minutes")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1440:
+            raise ValidationFailed("offset_minutes 必须是 0 到 1440 的整数")
+        return cls(
+            offset_minutes=offset,
+            target_mw=decimal_value(
+                raw.get("target_mw"), "target_mw", minimum=Decimal("0"), maximum=Decimal("10000")
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeratingPolicy:
+    cable_derate_percent: Decimal
+    reactive_derate_percent: Decimal
+    min_spinning_reserve_mw: Decimal
+    safety_margin_percent: Decimal
+    trial_fraction: Decimal
+    min_power_factor: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: object) -> "DeratingPolicy":
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, Mapping):
+            raise ValidationFailed("derating 必须是对象")
+        return cls(
+            cable_derate_percent=decimal_value(
+                raw.get("cable_derate_percent", "5"), "cable_derate_percent",
+                minimum=Decimal("0"), maximum=Decimal("50"),
+            ),
+            reactive_derate_percent=decimal_value(
+                raw.get("reactive_derate_percent", "10"), "reactive_derate_percent",
+                minimum=Decimal("0"), maximum=Decimal("50"),
+            ),
+            min_spinning_reserve_mw=decimal_value(
+                raw.get("min_spinning_reserve_mw", "0"), "min_spinning_reserve_mw",
+                minimum=Decimal("0"), maximum=Decimal("1000"),
+            ),
+            safety_margin_percent=decimal_value(
+                raw.get("safety_margin_percent", "5"), "safety_margin_percent",
+                minimum=Decimal("0"), maximum=Decimal("50"),
+            ),
+            trial_fraction=decimal_value(
+                raw.get("trial_fraction", "0.25"), "trial_fraction",
+                minimum=Decimal("0.01"), maximum=Decimal("0.5"),
+            ),
+            min_power_factor=decimal_value(
+                raw.get("min_power_factor", "0.95"), "min_power_factor",
+                minimum=Decimal("0.85"), maximum=Decimal("0.999"),
+            ),
+        )
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "cable_derate_percent": format(self.cable_derate_percent, "f"),
+            "reactive_derate_percent": format(self.reactive_derate_percent, "f"),
+            "min_spinning_reserve_mw": format(self.min_spinning_reserve_mw, "f"),
+            "safety_margin_percent": format(self.safety_margin_percent, "f"),
+            "trial_fraction": format(self.trial_fraction, "f"),
+            "min_power_factor": format(self.min_power_factor, "f"),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RehearsalPlanRequest:
+    plan_id: str
+    snapshot_id: str
+    command_id: str
+    trajectory: tuple[TrajectoryPoint, ...]
+    derating: DeratingPolicy
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "RehearsalPlanRequest":
+        trajectory_raw = raw.get("target_trajectory")
+        if not isinstance(trajectory_raw, list) or not 1 <= len(trajectory_raw) <= 24:
+            raise ValidationFailed("target_trajectory 必须包含 1 到 24 个轨迹点")
+        points = tuple(TrajectoryPoint.from_dict(item) for item in trajectory_raw)
+        offsets = [point.offset_minutes for point in points]
+        if len(set(offsets)) != len(offsets) or offsets != sorted(offsets):
+            raise ValidationFailed("target_trajectory 的时间偏移必须严格递增")
+        targets = [point.target_mw for point in points]
+        if targets != sorted(targets):
+            raise ValidationFailed("target_trajectory 的目标功率必须单调不减")
+        if targets[-1] <= 0:
+            raise ValidationFailed("target_trajectory 的峰值功率必须大于零")
+        return cls(
+            plan_id=identifier(raw.get("plan_id"), "plan_id"),
+            snapshot_id=identifier(raw.get("snapshot_id"), "snapshot_id"),
+            command_id=identifier(raw.get("command_id"), "command_id"),
+            trajectory=points,
+            derating=DeratingPolicy.from_dict(raw.get("derating")),
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SupplyScenario:
     scenario_id: str
     name: str

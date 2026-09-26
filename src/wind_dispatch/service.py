@@ -11,7 +11,19 @@ from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    RehearsalPlanRequest,
+    RehearsalSnapshotRequest,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,14 +39,26 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .rehearsal import (
+    REVISION_KINDS,
+    build_stage_plan,
+    constraint_ceilings,
+    required_reservations,
+    safe_rollback_target,
+    total_ramp_mw_per_min,
+)
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "dispatcher": {
+        "nomination.write", "allocation.run", "transfer.write", "inventory.write",
+        "rehearsal.source", "rehearsal.write", "rehearsal.confirm", "rehearsal.advance",
+        "rehearsal.receipt", "rehearsal.read",
+    },
+    "risk": {"outage.write", "scenario.approve", "report.read", "rehearsal.rollback", "rehearsal.read"},
+    "auditor": {"report.read", "audit.read", "rehearsal.read"},
 }
 
 
@@ -547,6 +571,596 @@ class SupplyService:
             run_id = int(cursor.lastrowid)
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
+
+    # ---------- 调度预演阶段计划 ----------
+
+    def register_source_update(self, actor_id: str, source_kind: str, note: str = "") -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.source")
+        if source_kind not in REVISION_KINDS:
+            raise ValidationFailed("source_kind 必须是 units、sea_state 或 corridors")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT revision FROM rehearsal_source_states WHERE source_kind=?", (source_kind,)
+            ).fetchone()
+            revision = 1 if row is None else int(row["revision"]) + 1
+            if row is None:
+                self.connection.execute(
+                    "INSERT INTO rehearsal_source_states(source_kind,revision,note,updated_by,updated_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (source_kind, revision, note, actor_id, self._now()),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE rehearsal_source_states SET revision=?,note=?,updated_by=?,updated_at=? "
+                    "WHERE source_kind=?",
+                    (revision, note, actor_id, self._now(), source_kind),
+                )
+            self._audit(
+                "rehearsal_source", source_kind, "rehearsal.source_updated", actor_id,
+                {"revision": revision, "note": note},
+            )
+        return {"source_kind": source_kind, "revision": revision}
+
+    def _source_revisions(self) -> dict[str, int]:
+        rows = self.connection.execute(
+            "SELECT source_kind,revision FROM rehearsal_source_states"
+        ).fetchall()
+        revisions = {row["source_kind"]: int(row["revision"]) for row in rows}
+        return {kind: revisions.get(kind, 0) for kind in REVISION_KINDS}
+
+    def create_rehearsal_snapshot(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.write")
+        snapshot = RehearsalSnapshotRequest.from_dict(raw)
+        definition = canonical_json(raw)
+        content_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        revisions = self._source_revisions()
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO rehearsal_snapshots(snapshot_id,label,observed_at,definition_json,content_sha256,"
+                    "units_revision,sea_state_revision,corridors_revision,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        snapshot.snapshot_id,
+                        snapshot.label,
+                        snapshot.observed_at,
+                        definition,
+                        content_sha256,
+                        revisions["units"],
+                        revisions["sea_state"],
+                        revisions["corridors"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "rehearsal_snapshot", snapshot.snapshot_id, "rehearsal.snapshot_created",
+                    actor_id, {"sha256": content_sha256},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("快照编号或内容已经存在") from exc
+        return {
+            "snapshot_id": snapshot.snapshot_id,
+            "revision": 1,
+            "source_revisions": revisions,
+            "sha256": content_sha256,
+        }
+
+    def _rehearsal_snapshot(self, snapshot_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM rehearsal_snapshots WHERE snapshot_id=?", (snapshot_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("运行快照不存在")
+        return row
+
+    def _rehearsal_plan(self, plan_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM rehearsal_plans WHERE plan_id=?", (plan_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("预演计划不存在")
+        return row
+
+    def _snapshot_revisions(self, snapshot: sqlite3.Row) -> dict[str, int]:
+        return {kind: int(snapshot[f"{kind}_revision"]) for kind in REVISION_KINDS}
+
+    def _snapshot_fresh(self, snapshot: sqlite3.Row) -> bool:
+        return self._snapshot_revisions(snapshot) == self._source_revisions()
+
+    def _snapshot_ceilings(self, snapshot: sqlite3.Row, derating: Mapping[str, Any]) -> dict[str, Any]:
+        definition = json.loads(snapshot["definition_json"])
+        return constraint_ceilings(
+            units=definition["units"],
+            corridors=definition["corridors"],
+            sea_state=definition["sea_state"],
+            derating=derating,
+        )
+
+    def create_rehearsal_plan(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.write")
+        plan_request = RehearsalPlanRequest.from_dict(raw)
+        request_digest = digest(raw)
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM supply_idempotency "
+            "WHERE scope='rehearsal_plan' AND idempotency_key=?",
+            (plan_request.idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("幂等键对应不同预演计划内容")
+            return {**json.loads(stored["response_json"]), "replayed": True}
+        snapshot = self._rehearsal_snapshot(plan_request.snapshot_id)
+        if not self._snapshot_fresh(snapshot):
+            raise InvalidState("快照对应的底层版本已变化，请重新固定快照")
+        definition = json.loads(snapshot["definition_json"])
+        derating = plan_request.derating.as_dict()
+        ceilings = constraint_ceilings(
+            units=definition["units"],
+            corridors=definition["corridors"],
+            sea_state=definition["sea_state"],
+            derating=derating,
+        )
+        total_ramp = total_ramp_mw_per_min(definition["units"])
+        points = list(plan_request.trajectory)
+        for left, right in zip(points, points[1:]):
+            slope = (right.target_mw - left.target_mw) / Decimal(right.offset_minutes - left.offset_minutes)
+            if slope > total_ramp:
+                raise ValidationFailed("目标轨迹爬坡速率超出机组能力")
+        stage_plan = build_stage_plan(
+            trajectory=[{"offset_minutes": p.offset_minutes, "target_mw": p.target_mw} for p in points],
+            ceilings=ceilings,
+            derating=derating,
+        )
+        response = {
+            "plan_id": plan_request.plan_id,
+            "snapshot_id": snapshot["snapshot_id"],
+            "command_id": plan_request.command_id,
+            "state": "draft",
+            "revision": 1,
+            "ceiling_mw": stage_plan["ceiling_mw"],
+            "binding_constraints": stage_plan["binding_constraints"],
+            "stages": stage_plan["stages"],
+            "replayed": False,
+        }
+        trajectory_json = canonical_json([
+            {"offset_minutes": p.offset_minutes, "target_mw": decimal_text(p.target_mw)} for p in points
+        ])
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO rehearsal_plans(plan_id,snapshot_id,command_id,trajectory_json,derating_json,"
+                    "stages_json,ceiling_mw,binding_constraints_json,idempotency_key,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        plan_request.plan_id,
+                        snapshot["snapshot_id"],
+                        plan_request.command_id,
+                        trajectory_json,
+                        canonical_json(derating),
+                        canonical_json(stage_plan["stages"]),
+                        stage_plan["ceiling_mw"],
+                        canonical_json(stage_plan["binding_constraints"]),
+                        plan_request.idempotency_key,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self.connection.execute(
+                    "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                    "VALUES('rehearsal_plan',?,?,?,?)",
+                    (plan_request.idempotency_key, request_digest, canonical_json(response), self._now()),
+                )
+                self._audit(
+                    "rehearsal_plan", plan_request.plan_id, "rehearsal.plan_created", actor_id,
+                    {"snapshot_id": snapshot["snapshot_id"], "request_sha256": request_digest},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("预演计划编号或幂等键冲突") from exc
+        return response
+
+    def _active_pool_total(self, pool: str) -> Decimal:
+        rows = self.connection.execute(
+            "SELECT amount FROM rehearsal_reservations WHERE state='active' AND pool=?", (pool,)
+        ).fetchall()
+        return sum((Decimal(row["amount"]) for row in rows), Decimal("0"))
+
+    def _counted_receipt_stages(self, plan_id: str) -> set[int]:
+        rows = self.connection.execute(
+            "SELECT stage_index FROM rehearsal_receipts WHERE plan_id=? AND state='counted'", (plan_id,)
+        ).fetchall()
+        return {int(row["stage_index"]) for row in rows}
+
+    def _stage_event(
+        self, plan_id: str, stage_index: int, event_type: str, actor_id: str, detail: Mapping[str, Any]
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO rehearsal_stage_events(plan_id,stage_index,event_type,detail_json,actor_id,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (plan_id, stage_index, event_type, canonical_json(detail), actor_id, self._now()),
+        )
+
+    def confirm_rehearsal_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.confirm")
+        with transaction(self.connection, immediate=True):
+            plan = self._rehearsal_plan(plan_id)
+            if plan["state"] != "draft" or int(plan["revision"]) != expected_revision:
+                raise InvalidState("计划不是当前草稿版本")
+            snapshot = self._rehearsal_snapshot(plan["snapshot_id"])
+            if not self._snapshot_fresh(snapshot):
+                raise InvalidState("底层版本已变化，旧计划不能继续推进")
+            ceilings = self._snapshot_ceilings(snapshot, json.loads(plan["derating_json"]))
+            stages = json.loads(plan["stages_json"])
+            reservations = required_reservations(stages=stages, ceilings=ceilings)
+            pools = ceilings["pools"]
+            for pool_name in ("turbine_capability", "cable_thermal", "reactive_compensation"):
+                active = self._active_pool_total(pool_name)
+                incoming = sum(
+                    (Decimal(item["amount"]) for item in reservations if item["pool"] == pool_name),
+                    Decimal("0"),
+                )
+                capacity = Decimal(str(pools[pool_name]["capacity"]))
+                if active + incoming > capacity:
+                    raise Conflict(
+                        f"容量池 {pool_name} 不足：已预留 {active}，本次需要 {incoming}，上限 {capacity}"
+                    )
+            now = self._now()
+            for item in reservations:
+                self.connection.execute(
+                    "INSERT INTO rehearsal_reservations(plan_id,source_kind,pool,amount,unit,state,created_at) "
+                    "VALUES(?,?,?,?,?,'active',?)",
+                    (plan_id, item["source_kind"], item["pool"], item["amount"], item["unit"], now),
+                )
+            self.connection.execute(
+                "UPDATE rehearsal_plans SET state='confirmed',current_stage_index=0,revision=revision+1 "
+                "WHERE plan_id=?",
+                (plan_id,),
+            )
+            self._stage_event(plan_id, 0, "entered", actor_id, {"reason": "plan_confirmed"})
+            self._audit(
+                "rehearsal_plan", plan_id, "rehearsal.plan_confirmed", actor_id,
+                {"reservations": reservations},
+            )
+        return {
+            "plan_id": plan_id,
+            "state": "confirmed",
+            "current_stage_index": 0,
+            "revision": expected_revision + 1,
+            "reservations": reservations,
+        }
+
+    def advance_rehearsal_plan(self, actor_id: str, plan_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.advance")
+        with transaction(self.connection, immediate=True):
+            plan = self._rehearsal_plan(plan_id)
+            if plan["state"] not in ("confirmed", "in_progress"):
+                raise InvalidState("计划当前不可推进")
+            if int(plan["revision"]) != expected_revision:
+                raise InvalidState("计划版本已变化")
+            snapshot = self._rehearsal_snapshot(plan["snapshot_id"])
+            if not self._snapshot_fresh(snapshot):
+                raise InvalidState("底层版本已变化，旧计划不能继续推进")
+            stages = json.loads(plan["stages_json"])
+            current = int(plan["current_stage_index"])
+            if current not in self._counted_receipt_stages(plan_id):
+                raise InvalidState("当前阶段尚未收到现场回执")
+            next_index = current + 1
+            if next_index >= len(stages):
+                raise InvalidState("计划已到达最终阶段")
+            self.connection.execute(
+                "UPDATE rehearsal_plans SET state='in_progress',current_stage_index=?,revision=revision+1 "
+                "WHERE plan_id=?",
+                (next_index, plan_id),
+            )
+            self._stage_event(plan_id, next_index, "entered", actor_id, {})
+            self._audit(
+                "rehearsal_plan", plan_id, "rehearsal.stage_advanced", actor_id,
+                {"stage_index": next_index},
+            )
+        stage = stages[next_index]
+        return {
+            "plan_id": plan_id,
+            "state": "in_progress",
+            "current_stage_index": next_index,
+            "current_stage": stage["code"],
+            "revision": expected_revision + 1,
+        }
+
+    def record_rehearsal_receipt(
+        self, actor_id: str, plan_id: str, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.receipt")
+        receipt_id = identifier(raw.get("receipt_id"), "receipt_id")
+        stage_index = raw.get("stage_index")
+        if isinstance(stage_index, bool) or not isinstance(stage_index, int) or stage_index < 0:
+            raise ValidationFailed("stage_index 必须是非负整数")
+        outcome = required_text(raw.get("outcome"), "outcome", 16)
+        if outcome != "executed":
+            raise ValidationFailed("outcome 仅支持 executed")
+        detail = raw.get("detail", {})
+        if not isinstance(detail, Mapping):
+            raise ValidationFailed("detail 必须是对象")
+        request_digest = digest(raw)
+        stored = self.connection.execute(
+            "SELECT request_sha256,response_json FROM rehearsal_receipts WHERE plan_id=? AND receipt_id=?",
+            (plan_id, receipt_id),
+        ).fetchone()
+        if stored is not None:
+            if stored["request_sha256"] != request_digest:
+                raise Conflict("回执编号对应不同内容")
+            return {**json.loads(stored["response_json"]), "replayed": True}
+        try:
+            with transaction(self.connection, immediate=True):
+                plan = self._rehearsal_plan(plan_id)
+                if plan["state"] not in ("confirmed", "in_progress"):
+                    raise InvalidState("计划当前不可登记回执")
+                current = int(plan["current_stage_index"])
+                if stage_index != current:
+                    raise Conflict("回执阶段与计划当前阶段不符")
+                if current in self._counted_receipt_stages(plan_id):
+                    raise Conflict("当前阶段已有生效回执")
+                stages = json.loads(plan["stages_json"])
+                completed = stage_index == len(stages) - 1
+                new_state = "completed" if completed else "in_progress"
+                response = {
+                    "receipt_id": receipt_id,
+                    "plan_id": plan_id,
+                    "stage_index": stage_index,
+                    "plan_state": new_state,
+                    "plan_revision": int(plan["revision"]) + 1,
+                    "replayed": False,
+                }
+                now = self._now()
+                self.connection.execute(
+                    "INSERT INTO rehearsal_receipts(receipt_id,plan_id,stage_index,outcome,detail_json,"
+                    "request_sha256,response_json,state,received_by,received_at) "
+                    "VALUES(?,?,?,?,?,?,?,'counted',?,?)",
+                    (
+                        receipt_id,
+                        plan_id,
+                        stage_index,
+                        outcome,
+                        canonical_json(detail),
+                        request_digest,
+                        canonical_json(response),
+                        actor_id,
+                        now,
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE rehearsal_plans SET state=?,revision=revision+1 WHERE plan_id=?",
+                    (new_state, plan_id),
+                )
+                self._stage_event(plan_id, stage_index, "executed", actor_id, {"receipt_id": receipt_id})
+                if completed:
+                    self.connection.execute(
+                        "UPDATE rehearsal_reservations SET state='released',released_at=? "
+                        "WHERE plan_id=? AND state='active'",
+                        (now, plan_id),
+                    )
+                    self._stage_event(plan_id, stage_index, "completed", actor_id, {})
+                self._audit(
+                    "rehearsal_plan", plan_id, "rehearsal.receipt_recorded", actor_id,
+                    {"receipt_id": receipt_id, "stage_index": stage_index},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("回执编号冲突") from exc
+        return response
+
+    def rollback_rehearsal_plan(
+        self, actor_id: str, plan_id: str, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.rollback")
+        reason = required_text(raw.get("reason"), "reason", 256)
+        override = raw.get("ceiling_override_mw")
+        override_decimal = None if override is None else decimal_value(
+            override, "ceiling_override_mw", minimum=Decimal("0")
+        )
+        requested_target = raw.get("to_stage_index")
+        if requested_target is not None and (
+            isinstance(requested_target, bool) or not isinstance(requested_target, int) or requested_target < -1
+        ):
+            raise ValidationFailed("to_stage_index 必须是 -1 或更大的整数")
+        with transaction(self.connection, immediate=True):
+            plan = self._rehearsal_plan(plan_id)
+            if plan["state"] not in ("confirmed", "in_progress"):
+                raise InvalidState("计划当前不可回退")
+            stages = json.loads(plan["stages_json"])
+            current = int(plan["current_stage_index"])
+            planned_ceiling = Decimal(plan["ceiling_mw"])
+            effective = planned_ceiling if override_decimal is None else min(planned_ceiling, override_decimal)
+            executed = self._counted_receipt_stages(plan_id)
+            target = safe_rollback_target(
+                stages=stages,
+                executed_indexes=executed,
+                current_index=current,
+                effective_ceiling_mw=effective,
+            )
+            if requested_target is not None:
+                if requested_target > target:
+                    raise InvalidState("回退目标超出仍安全的阶段")
+                target = requested_target
+            now = self._now()
+            # 保留已执行证据：回执行不删除，仅将高于目标阶段的生效回执标记为 superseded
+            self.connection.execute(
+                "UPDATE rehearsal_receipts SET state='superseded' "
+                "WHERE plan_id=? AND stage_index>? AND state='counted'",
+                (plan_id, target),
+            )
+            for index in range(target + 1, current + 1):
+                self._stage_event(plan_id, index, "retreated", actor_id, {"reason": reason})
+            new_state = "aborted" if target < 0 else "in_progress"
+            if target < 0:
+                self.connection.execute(
+                    "UPDATE rehearsal_reservations SET state='released',released_at=? "
+                    "WHERE plan_id=? AND state='active'",
+                    (now, plan_id),
+                )
+            self.connection.execute(
+                "UPDATE rehearsal_plans SET state=?,current_stage_index=?,revision=revision+1 WHERE plan_id=?",
+                (new_state, target, plan_id),
+            )
+            self._stage_event(
+                plan_id, target, "rolled_back", actor_id,
+                {
+                    "reason": reason,
+                    "from_stage_index": current,
+                    "effective_ceiling_mw": decimal_text(effective),
+                },
+            )
+            self._audit(
+                "rehearsal_plan", plan_id, "rehearsal.rolled_back", actor_id,
+                {"reason": reason, "from": current, "to": target},
+            )
+        return {
+            "plan_id": plan_id,
+            "state": new_state,
+            "current_stage_index": target,
+            "rolled_back_from": current,
+            "revision": int(plan["revision"]) + 1,
+        }
+
+    def rehearsal_plan_status(self, actor_id: str, plan_id: str) -> dict[str, Any]:
+        self._require(actor_id, "rehearsal.read")
+        plan = self._rehearsal_plan(plan_id)
+        snapshot = self._rehearsal_snapshot(plan["snapshot_id"])
+        ceilings = self._snapshot_ceilings(snapshot, json.loads(plan["derating_json"]))
+        stages = json.loads(plan["stages_json"])
+        current = int(plan["current_stage_index"])
+        fresh = self._snapshot_fresh(snapshot)
+        executed = self._counted_receipt_stages(plan_id)
+        planned_ceiling = Decimal(plan["ceiling_mw"])
+        receipt_rows = self.connection.execute(
+            "SELECT * FROM rehearsal_receipts WHERE plan_id=? ORDER BY received_at,receipt_id", (plan_id,)
+        ).fetchall()
+        superseded = {int(row["stage_index"]) for row in receipt_rows if row["state"] == "superseded"}
+        reservation_rows = self.connection.execute(
+            "SELECT * FROM rehearsal_reservations WHERE plan_id=? ORDER BY reservation_id", (plan_id,)
+        ).fetchall()
+        has_active_reservation = any(row["state"] == "active" for row in reservation_rows)
+        basis = {item["source_kind"]: item["basis"] for item in ceilings["constraints"]}
+        pools = ceilings["pools"]
+        pool_totals = {pool: self._active_pool_total(pool) for pool in pools}
+        capacity_sources = []
+        for row in reservation_rows:
+            pool = row["pool"]
+            capacity = Decimal(str(pools[pool]["capacity"]))
+            capacity_sources.append({
+                "source_kind": row["source_kind"],
+                "reserved": row["amount"],
+                "unit": row["unit"],
+                "state": row["state"],
+                "pool": pool,
+                "pool_capacity": decimal_text(quantize_volume(capacity)),
+                "pool_active_reserved": decimal_text(quantize_volume(pool_totals[pool])),
+                "pool_remaining": decimal_text(quantize_volume(capacity - pool_totals[pool])),
+                "basis": basis.get(row["source_kind"], ""),
+            })
+        active = plan["state"] in ("confirmed", "in_progress")
+        stage_views = []
+        for stage in stages:
+            index = int(stage["index"])
+            if index in executed:
+                stage_state = "executed"
+            elif index == current and active:
+                stage_state = "entered"
+            elif index in superseded:
+                stage_state = "retreated"
+            else:
+                stage_state = "pending"
+            conditions = [
+                {"code": "snapshot_fresh", "met": fresh},
+                {"code": "reservations_active", "met": has_active_reservation},
+                {
+                    "code": "headroom_sufficient",
+                    "met": Decimal(stage["required_headroom_mw"]) <= planned_ceiling,
+                },
+            ]
+            if index >= 1:
+                conditions.append({"code": "previous_stage_executed", "met": (index - 1) in executed})
+            stage_views.append({**stage, "state": stage_state, "entry_conditions": conditions})
+        blocking: list[dict[str, Any]] = []
+        if active:
+            if not fresh:
+                blocking.append({"code": "snapshot_stale", "detail": "底层版本已变化，旧计划不能继续推进"})
+            if current not in executed:
+                blocking.append({
+                    "code": "receipt_missing",
+                    "stage_index": current,
+                    "detail": "当前阶段尚未收到现场回执",
+                })
+            next_index = current + 1
+            if next_index < len(stages) and not stages[next_index]["reachable"]:
+                for item in stages[next_index]["blocking_constraints"]:
+                    blocking.append({"code": "capacity_boundary", **item, "detail": "目标功率超出该约束边界"})
+        current_view = None
+        if 0 <= current < len(stages):
+            stage = stages[current]
+            current_view = {
+                "index": current,
+                "code": stage["code"],
+                "label": stage["label"],
+                "target_mw": stage["target_mw"],
+                "executed": current in executed,
+            }
+        if active:
+            rollback_target = safe_rollback_target(
+                stages=stages,
+                executed_indexes=executed,
+                current_index=current,
+                effective_ceiling_mw=planned_ceiling,
+            )
+            rollback_info: dict[str, Any] = {
+                "target_stage_index": rollback_target,
+                "target_stage": "abort" if rollback_target < 0 else stages[rollback_target]["code"],
+                "current_stage_safe": current >= 0
+                and Decimal(stages[current]["required_headroom_mw"]) <= planned_ceiling,
+            }
+        else:
+            rollback_info = {"target_stage_index": None, "target_stage": None, "current_stage_safe": None}
+        event_rows = self.connection.execute(
+            "SELECT stage_index,event_type,detail_json,actor_id,created_at FROM rehearsal_stage_events "
+            "WHERE plan_id=? ORDER BY event_id",
+            (plan_id,),
+        ).fetchall()
+        return {
+            "plan_id": plan["plan_id"],
+            "command_id": plan["command_id"],
+            "state": plan["state"],
+            "revision": int(plan["revision"]),
+            "snapshot": {
+                "snapshot_id": snapshot["snapshot_id"],
+                "stale": not fresh,
+                "source_revisions": self._snapshot_revisions(snapshot),
+                "current_revisions": self._source_revisions(),
+            },
+            "ceiling_mw": plan["ceiling_mw"],
+            "binding_constraints": json.loads(plan["binding_constraints_json"]),
+            "current_stage": current_view,
+            "stages": stage_views,
+            "capacity_sources": capacity_sources,
+            "blocking_constraints": blocking,
+            "rollback": rollback_info,
+            "receipts": [
+                {
+                    "receipt_id": row["receipt_id"],
+                    "stage_index": int(row["stage_index"]),
+                    "state": row["state"],
+                    "received_at": row["received_at"],
+                }
+                for row in receipt_rows
+            ],
+            "events": [
+                {
+                    "stage_index": int(row["stage_index"]),
+                    "event_type": row["event_type"],
+                    "detail": json.loads(row["detail_json"]),
+                    "actor_id": row["actor_id"],
+                    "created_at": row["created_at"],
+                }
+                for row in event_rows
+            ],
+        }
 
     def audit_chain(self, actor_id: str) -> dict[str, Any]:
         self._require(actor_id, "audit.read")

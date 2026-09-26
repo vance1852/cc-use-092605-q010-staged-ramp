@@ -30,7 +30,50 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "grid-recovery", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"fanshi-export": "20"}, "demand_changes": {"fanshi-one:turbine-18mw": "-5"}})
     service.approve_scenario("risk", "grid-recovery", 1)
     scenario = service.run_scenario("plan", "grid-recovery", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    units = [
+        {"unit_id": f"WTG-{project}{index:02d}", "project": project, "rated_mw": "18", "available": True, "ramp_mw_per_min": "3"}
+        for project in ("alpha", "beta")
+        for index in range(1, 57)
+    ]
+    service.create_rehearsal_snapshot("dispatch", {
+        "snapshot_id": "snap-peak-001",
+        "label": "调峰指令前运行快照",
+        "observed_at": "2026-09-24T07:30:00Z",
+        "units": units,
+        "sea_state": {"wind_speed_mps": "12.5", "wave_height_m": "2.1"},
+        "corridors": [
+            {"corridor_id": "export-alpha", "cable_thermal_limit_mw": "1200", "reactive_limit_mvar": "400", "spinning_reserve_mw": "80"},
+            {"corridor_id": "export-beta", "cable_thermal_limit_mw": "1200", "reactive_limit_mvar": "400", "spinning_reserve_mw": "70"},
+        ],
+    })
+    plan = service.create_rehearsal_plan("dispatch", {
+        "plan_id": "rehearsal-peak-001",
+        "snapshot_id": "snap-peak-001",
+        "command_id": "peak-2026-09-26",
+        "target_trajectory": [
+            {"offset_minutes": 0, "target_mw": "0"},
+            {"offset_minutes": 30, "target_mw": "600"},
+            {"offset_minutes": 60, "target_mw": "1200"},
+            {"offset_minutes": 120, "target_mw": "1800"},
+        ],
+        "derating": {
+            "cable_derate_percent": "5",
+            "reactive_derate_percent": "10",
+            "min_spinning_reserve_mw": "150",
+            "safety_margin_percent": "5",
+            "trial_fraction": "0.25",
+            "min_power_factor": "0.95",
+        },
+        "idempotency_key": "rehearsal-key-001",
+    })
+    service.confirm_rehearsal_plan("dispatch", "rehearsal-peak-001", 1)
+    for stage in range(4):
+        service.record_rehearsal_receipt("dispatch", "rehearsal-peak-001", {"receipt_id": f"rcpt-{stage}", "stage_index": stage, "outcome": "executed", "detail": {"operator": "offshore-shift"}})
+        if stage < 3:
+            status = service.rehearsal_plan_status("dispatch", "rehearsal-peak-001")
+            service.advance_rehearsal_plan("dispatch", "rehearsal-peak-001", status["revision"])
+    rehearsal = service.rehearsal_plan_status("dispatch", "rehearsal-peak-001")
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "rehearsal": {"plan_id": rehearsal["plan_id"], "state": rehearsal["state"], "current_stage": rehearsal["current_stage"]["code"], "ceiling_mw": rehearsal["ceiling_mw"], "binding_constraints": rehearsal["binding_constraints"], "capacity_sources": len(rehearsal["capacity_sources"]), "stages": [{"code": stage["code"], "target_mw": stage["target_mw"], "rollback_margin_mw": stage["rollback_margin_mw"]} for stage in rehearsal["stages"]]}, "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

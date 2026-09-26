@@ -171,6 +171,89 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS rehearsal_source_states (
+    source_kind TEXT PRIMARY KEY CHECK(source_kind IN ('units','sea_state','corridors')),
+    revision INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rehearsal_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL UNIQUE,
+    units_revision INTEGER NOT NULL,
+    sea_state_revision INTEGER NOT NULL,
+    corridors_revision INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rehearsal_plans (
+    plan_id TEXT PRIMARY KEY,
+    snapshot_id TEXT NOT NULL REFERENCES rehearsal_snapshots(snapshot_id),
+    command_id TEXT NOT NULL,
+    trajectory_json TEXT NOT NULL,
+    derating_json TEXT NOT NULL,
+    stages_json TEXT NOT NULL,
+    ceiling_mw TEXT NOT NULL,
+    binding_constraints_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft'
+        CHECK(state IN ('draft','confirmed','in_progress','completed','aborted')),
+    current_stage_index INTEGER NOT NULL DEFAULT -1,
+    revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rehearsal_reservations (
+    reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES rehearsal_plans(plan_id),
+    source_kind TEXT NOT NULL,
+    pool TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','released')),
+    released_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rehearsal_reservations_pool
+ON rehearsal_reservations(pool, state);
+
+CREATE TABLE IF NOT EXISTS rehearsal_receipts (
+    receipt_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES rehearsal_plans(plan_id),
+    stage_index INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'counted' CHECK(state IN ('counted','superseded')),
+    received_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    received_at TEXT NOT NULL,
+    PRIMARY KEY(plan_id, receipt_id)
+);
+
+CREATE TABLE IF NOT EXISTS rehearsal_stage_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES rehearsal_plans(plan_id),
+    stage_index INTEGER NOT NULL,
+    event_type TEXT NOT NULL
+        CHECK(event_type IN ('entered','executed','retreated','rolled_back','completed')),
+    detail_json TEXT NOT NULL,
+    actor_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rehearsal_stage_events_plan
+ON rehearsal_stage_events(plan_id, event_id);
+
 CREATE TABLE IF NOT EXISTS supply_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
